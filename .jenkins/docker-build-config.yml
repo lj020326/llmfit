@@ -1,0 +1,20 @@
+---
+alwaysEmailList: ljohnson@dettonville.org
+logLevel: DEBUG
+maxRandomDelaySeconds: 20
+
+runGroupsInParallel: false
+runInParallel: true
+
+buildArgs:
+  IMAGE_REGISTRY: media.johnson.int:5000
+
+buildPlatforms:
+  - linux/amd64
+  - linux/arm64
+
+buildTags:
+  - "latest"
+
+buildImageList:
+  - buildImageName: "llmfit"

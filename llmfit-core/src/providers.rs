@@ -3248,10 +3248,16 @@ fn docker_mr_installed_matches(installed_name: &str, candidate: &str) -> bool {
 /// Strip quantization suffix from a GGUF file stem.
 /// "llama-3.1-8b-instruct-q4_k_m" → "llama-3.1-8b-instruct"
 pub fn strip_gguf_quant_suffix(stem: &str) -> Option<String> {
+    // Matched on the quant *family* stem rather than each published variant:
+    // K-quants as `-qN_k` and I-quants as `-iqN_`, so `_S`/`_M`/`_L`/`_XL`
+    // and `_NL`/`_XS`/`_XXS` all reduce to the same base. Enumerating the
+    // variants instead left whole publishers unmatched — bartowski `_L` files
+    // and Unsloth Dynamic `_XL`/`IQ4_NL` files never reached the catalog id,
+    // so they read as neither installed nor served.
     let quant_patterns = [
-        "-q8_0", "-q6_k", "-q6_k_l", "-q5_k_m", "-q5_k_s", "-q4_k_m", "-q4_k_s", "-q4_0",
-        "-q3_k_m", "-q3_k_s", "-q2_k", "-iq4_xs", "-iq3_m", "-iq2_m", "-iq1_m", "-f16", "-f32",
-        "-bf16", ".q8_0", ".q6_k", ".q5_k_m", ".q4_k_m", ".q4_0", ".q3_k_m", ".q2_k",
+        "-q8_0", "-q8_k", "-q6_k", "-q5_k", "-q4_k", "-q4_0", "-q3_k", "-q2_k", "-iq4_", "-iq3_",
+        "-iq2_", "-iq1_", "-f16", "-f32", "-bf16", ".q8_0", ".q6_k", ".q5_k", ".q4_k", ".q4_0",
+        ".q3_k", ".q2_k",
     ];
     for pat in &quant_patterns {
         if let Some(pos) = stem.rfind(pat) {
@@ -4067,7 +4073,45 @@ pub fn has_ollama_mapping(hf_name: &str) -> bool {
     lookup_ollama_tag(hf_name).is_some()
 }
 
-fn ollama_installed_matches_candidate(installed_name: &str, candidate: &str) -> bool {
+/// Largest ratio between a catalog entry's parameter count and an installed
+/// tag's size before the two are treated as different models. Deliberately
+/// loose: Ollama tags round (`phi4:14b` for a 14.7B model), so the check is
+/// only meant to catch mismatches of a different order, like a 14B tag
+/// standing in for a 684B model.
+const OLLAMA_SIZE_MISMATCH_RATIO: f64 = 2.0;
+
+/// Parse the size out of an Ollama tag: `deepseek-r1:14b` -> `14.0`,
+/// `qwen2.5-coder:7b-instruct-q4_K_M` -> `7.0`. Returns `None` for tags with
+/// no parseable size, including `8x7b`-style MoE tags and bare family stems.
+fn ollama_tag_size_b(installed_name: &str) -> Option<f64> {
+    let size = installed_name.split(':').nth(1)?;
+    let head = size.split('-').next()?;
+    head.strip_suffix('b')?.parse::<f64>().ok()
+}
+
+/// Does an installed tag's size agree with the catalog entry's parameter
+/// count? Unknown on either side means "no opinion", which keeps the previous
+/// permissive behaviour rather than dropping a real install.
+fn ollama_size_is_compatible(installed_name: &str, catalog_params_b: Option<f64>) -> bool {
+    let (Some(catalog), Some(tag)) = (catalog_params_b, ollama_tag_size_b(installed_name)) else {
+        return true;
+    };
+    if catalog <= 0.0 || tag <= 0.0 {
+        return true;
+    }
+    let ratio = if catalog > tag {
+        catalog / tag
+    } else {
+        tag / catalog
+    };
+    ratio <= OLLAMA_SIZE_MISMATCH_RATIO
+}
+
+fn ollama_installed_matches_candidate(
+    installed_name: &str,
+    candidate: &str,
+    catalog_params_b: Option<f64>,
+) -> bool {
     if installed_name == candidate {
         return true;
     }
@@ -4082,16 +4126,31 @@ fn ollama_installed_matches_candidate(installed_name: &str, candidate: &str) -> 
     // A size-less candidate is family-level by construction — either an
     // `OLLAMA_MAPPINGS` entry whose tag carries no size (`phi-4` → `phi4`,
     // `qwq-32b` → `qwq`) or an HF name with no size to parse. Any tag of that
-    // family is then the model in question, so match `phi4:14b` too. Candidates
-    // derived from a *sized* HF name never reach here (see
-    // `hf_name_to_ollama_candidates`), which is what keeps this from matching
-    // a whole family again.
+    // family is *usually* the model in question, so match `phi4:14b` too.
+    //
+    // "Usually" is why the size check is here. Some families publish one bare
+    // tag for wildly different models: `deepseek-r1` covers both the 684B
+    // original and the 14B Qwen distill, so `deepseek-r1:14b` would otherwise
+    // mark the 397 GB entry installed. Candidates derived from a *sized* HF
+    // name never reach here (see `hf_name_to_ollama_candidates`).
     installed_name.starts_with(&format!("{candidate}:"))
+        && ollama_size_is_compatible(installed_name, catalog_params_b)
 }
 
 /// Check if any of the Ollama candidates for an HF model appear in the
 /// installed set.
 pub fn is_model_installed(hf_name: &str, installed: &HashSet<String>) -> bool {
+    is_model_installed_sized(hf_name, None, installed)
+}
+
+/// Like [`is_model_installed`], but takes the catalog entry's parameter count
+/// so a family-level tag match can be rejected when the sizes disagree. Pass
+/// `None` when the size is unknown; the match is then as permissive as before.
+pub fn is_model_installed_sized(
+    hf_name: &str,
+    catalog_params_b: Option<f64>,
+    installed: &HashSet<String>,
+) -> bool {
     // Quick check: the installed set may contain the full HF name (lowercased)
     // from providers that report it verbatim (e.g. MLX server, /api/v1/installed).
     if installed.contains(&hf_name.to_lowercase()) {
@@ -4100,9 +4159,9 @@ pub fn is_model_installed(hf_name: &str, installed: &HashSet<String>) -> bool {
 
     let candidates = hf_name_to_ollama_candidates(hf_name);
     candidates.iter().any(|candidate| {
-        installed
-            .iter()
-            .any(|installed_name| ollama_installed_matches_candidate(installed_name, candidate))
+        installed.iter().any(|installed_name| {
+            ollama_installed_matches_candidate(installed_name, candidate, catalog_params_b)
+        })
     })
 }
 
@@ -5124,6 +5183,53 @@ mod tests {
     }
 
     #[test]
+    fn test_strip_gguf_quant_suffix_covers_every_k_and_i_variant() {
+        // Publishers ship far more variants than Q4_K_M: bartowski `_L`,
+        // Unsloth Dynamic `_XL`, and the IQ family's `_NL`/`_XS`/`_XXS`.
+        // Every one must reduce to the same base name.
+        for stem in [
+            "mymodel-q3_k_l",
+            "mymodel-q4_k_l",
+            "mymodel-q4_k_xl",
+            "mymodel-q5_k_xl",
+            "mymodel-q6_k_l",
+            "mymodel-q8_k_xl",
+            "mymodel-iq4_nl",
+            "mymodel-iq4_xs",
+            "mymodel-iq3_xxs",
+            "mymodel-iq2_m",
+            // Same set behind the Unsloth `-ud` marker.
+            "mymodel-ud-q4_k_xl",
+            "mymodel-ud-iq4_nl",
+        ] {
+            assert_eq!(
+                strip_gguf_quant_suffix(stem).as_deref(),
+                Some("mymodel"),
+                "failed to strip quant from {stem}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_tag_matches_model_unsloth_dynamic_quants() {
+        // Community submissions record the on-disk file name verbatim. These
+        // three tags from the NVIDIA GB10 set (#872) were silently dropped
+        // during lookup because their quants had no matching pattern.
+        assert!(tag_matches_model(
+            "Step-3.7-Flash-UD-IQ4_NL.gguf",
+            "stepfun-ai/Step-3.7-Flash"
+        ));
+        assert!(tag_matches_model(
+            "Qwen-AgentWorld-35B-A3B-UD-Q4_K_XL.gguf",
+            "Qwen/Qwen-AgentWorld-35B-A3B"
+        ));
+        assert!(tag_matches_model(
+            "LFM2.5-8B-A1B-UD-Q4_K_XL.gguf",
+            "LiquidAI/LFM2.5-8B-A1B"
+        ));
+    }
+
+    #[test]
     fn test_is_model_installed_llamacpp_unsloth_ud() {
         // `Qwen3.6-35B-A3B-UD-Q4_K_M.gguf` on disk yields these set entries
         // (see `installed_models_counted`) and must mark the catalog model as
@@ -5368,7 +5474,8 @@ mod tests {
     fn test_ollama_installed_matches_exact() {
         assert!(ollama_installed_matches_candidate(
             "llama3.1:8b",
-            "llama3.1:8b"
+            "llama3.1:8b",
+            None
         ));
     }
 
@@ -5376,7 +5483,8 @@ mod tests {
     fn test_ollama_installed_matches_variant_suffix() {
         assert!(ollama_installed_matches_candidate(
             "llama3.1:8b-instruct-q4_K_M",
-            "llama3.1:8b"
+            "llama3.1:8b",
+            None
         ));
     }
 
@@ -5384,8 +5492,99 @@ mod tests {
     fn test_ollama_installed_no_match() {
         assert!(!ollama_installed_matches_candidate(
             "qwen2.5:7b",
-            "llama3.1:8b"
+            "llama3.1:8b",
+            None
         ));
+    }
+
+    // ── size-aware family matching ───────────────────────────────────
+
+    fn deepseek_14b_installed() -> HashSet<String> {
+        let mut installed = HashSet::new();
+        installed.insert("deepseek-r1:14b".to_string());
+        installed
+    }
+
+    #[test]
+    fn test_ollama_tag_size_parsing() {
+        assert_eq!(ollama_tag_size_b("deepseek-r1:14b"), Some(14.0));
+        assert_eq!(ollama_tag_size_b("deepseek-r1:1.5b"), Some(1.5));
+        assert_eq!(
+            ollama_tag_size_b("qwen2.5-coder:7b-instruct-q4_K_M"),
+            Some(7.0)
+        );
+        // No size to read: bare family stem, MoE-style tag, or a plain name.
+        assert_eq!(ollama_tag_size_b("glm-4.7-flash"), None);
+        assert_eq!(ollama_tag_size_b("mixtral:8x7b"), None);
+        assert_eq!(ollama_tag_size_b("deepseek-r1:latest"), None);
+    }
+
+    #[test]
+    fn test_sized_family_tag_does_not_mark_much_larger_model_installed() {
+        // `deepseek-r1` is the mapped tag for the 684B original *and* the
+        // family prefix of the 14B distill. Having the distill must not claim
+        // the 397 GB model is on disk.
+        let installed = deepseek_14b_installed();
+        assert!(!is_model_installed_sized(
+            "deepseek-ai/DeepSeek-R1",
+            Some(684.5),
+            &installed
+        ));
+        assert!(!is_model_installed_sized(
+            "deepseek-ai/DeepSeek-R1-0528",
+            Some(684.5),
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_sized_family_tag_still_matches_the_model_it_belongs_to() {
+        let installed = deepseek_14b_installed();
+        // The distill maps to `deepseek-r1:14b` outright.
+        assert!(is_model_installed_sized(
+            "deepseek-ai/DeepSeek-R1-Distill-Qwen-14B",
+            Some(14.8),
+            &installed
+        ));
+        // And the real 684B model is matched by a tag of its own size.
+        let mut big = HashSet::new();
+        big.insert("deepseek-r1:671b".to_string());
+        assert!(is_model_installed_sized(
+            "deepseek-ai/DeepSeek-R1",
+            Some(684.5),
+            &big
+        ));
+    }
+
+    #[test]
+    fn test_size_rounding_in_tags_still_matches() {
+        // Ollama tags round: phi4:14b is a 14.7B model, qwq:32b is 32.8B.
+        let mut installed = HashSet::new();
+        installed.insert("phi4:14b".to_string());
+        installed.insert("qwq:32b".to_string());
+        assert!(is_model_installed_sized(
+            "microsoft/phi-4",
+            Some(14.7),
+            &installed
+        ));
+        assert!(is_model_installed_sized(
+            "Qwen/QwQ-32B",
+            Some(32.8),
+            &installed
+        ));
+    }
+
+    #[test]
+    fn test_unknown_catalog_size_stays_permissive() {
+        // With no parameter count recorded there is nothing to compare, so
+        // behaviour must be exactly what it was before the size check.
+        let installed = deepseek_14b_installed();
+        assert!(is_model_installed_sized(
+            "deepseek-ai/DeepSeek-R1",
+            None,
+            &installed
+        ));
+        assert!(is_model_installed("deepseek-ai/DeepSeek-R1", &installed));
     }
 
     // ── parse_repo_gguf_entries ──────────────────────────────────────
