@@ -9,6 +9,9 @@ jobs:
   docker:
     runs-on: ubuntu-latest
     steps:
+      - name: Wait for workflow queue
+        uses: ahmadnassri/action-workflow-queue@v1
+
       - name: Checkout Code
         uses: actions/checkout@v4
 
