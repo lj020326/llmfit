@@ -2,8 +2,7 @@
 set -euo pipefail
 
 COMPOSE_FILE="${COMPOSE_FILE:-tests/docker-compose.yml}"
-FRONTEND_URL="${FRONTEND_URL:-http://localhost:8787}"
-BACKEND_URL="${BACKEND_URL:-http://localhost:8788}"
+LLMFIT_URL="${LLMFIT_URL:-http://localhost:8787}"
 MAX_RETRIES=30
 RETRY_INTERVAL=2
 
@@ -35,17 +34,17 @@ wait_for_service() {
 }
 
 # 1. Verify direct backend service availability
-wait_for_service "${BACKEND_URL}/api/v1/system" "Direct Backend API"
+wait_for_service "${LLMFIT_URL}/api/v1/system" "Direct Backend API"
 
 # 2. Verify frontend service availability
-wait_for_service "${FRONTEND_URL}" "Frontend UI"
+wait_for_service "${LLMFIT_URL}" "Frontend UI"
 
 # 3. Verify end-to-end API request through frontend Vite proxy
 echo "==> Verifying end-to-end API proxy (Frontend -> Backend)..."
-PROXY_RESPONSE=$(curl -s -S -f "${FRONTEND_URL}/api/v1/system")
+PROXY_RESPONSE=$(curl -s -S -f "${LLMFIT_URL}/api/v1/system")
 
 if echo "${PROXY_RESPONSE}" | grep -q '"system"'; then
-  echo "✔ End-to-end API proxy check passed via ${FRONTEND_URL}/api/v1/system"
+  echo "✔ End-to-end API proxy check passed via ${LLMFIT_URL}/api/v1/system"
 else
   echo "ERROR: Proxy response did not contain expected payload."
   echo "Received: ${PROXY_RESPONSE}"
