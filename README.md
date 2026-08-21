@@ -144,7 +144,7 @@ podman run lj020326/llmfit recommend --use-case coding | jq '.models[].name'
 ```
 To launch the interactive TUI instead, pass the global `--tui` flag:
 ```sh
-docker run --rm -it lj020326/alexsjones/llmfit --tui
+docker run --rm -it lj020326/llmfit --tui
 ```
 
 ### From source
